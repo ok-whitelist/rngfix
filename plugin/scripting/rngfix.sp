@@ -51,6 +51,7 @@ int g_iLastMapTeleportTick[MAXPLAYERS+1];
 bool g_bMapTeleportedSequentialTicks[MAXPLAYERS+1];
 float g_vCollisionPoint[MAXPLAYERS+1][3];
 float g_vCollisionNormal[MAXPLAYERS+1][3];
+float g_vPostDuckOrigin[MAXPLAYERS+1][3];
 
 enum
 {
@@ -699,6 +700,7 @@ void RunPreTickChecks(int client, Handle hParams)
 	// These roughly replicate the behavior of their equivalent CGameMovement functions.
 
 	Duck(client, nextOrigin, mins, maxs);
+	g_vPostDuckOrigin[client] = nextOrigin;
 
 	StartGravity(client, velocity);
 
@@ -858,7 +860,7 @@ public void Hook_PlayerGroundEntChanged(int client)
 	}
 }
 
-bool DoTriggerjumpFix(int client, const float landingPoint[3], const float landingMins[3], const float landingMaxs[3])
+bool DoTriggerjumpFix(int client, const float landingPoint[3], const float landingMins[3], const float landingMaxs[3], float height)
 {
 	if (!g_cvTriggerjump.BoolValue) return false;
 
@@ -866,13 +868,10 @@ bool DoTriggerjumpFix(int client, const float landingPoint[3], const float landi
 	// another location, and then the trigger jumping fix wouldn't fire the other trigger you technically landed above,
 	// but I can't imagine a mapper would ever actually stack triggers like that.
 
-	float origin[3];
-	GetEntPropVector(client, Prop_Data, "m_vecAbsOrigin", origin);
-
 	float landingMaxsBelow[3];
 	landingMaxsBelow[0] = landingMaxs[0];
 	landingMaxsBelow[1] = landingMaxs[1];
-	landingMaxsBelow[2] = origin[2] - landingPoint[2];
+	landingMaxsBelow[2] = height;
 
 	ArrayList triggers = new ArrayList();
 
@@ -899,6 +898,25 @@ bool DoTriggerjumpFix(int client, const float landingPoint[3], const float landi
 	delete triggers;
 
 	return didSomething;
+}
+
+void DoMidTickTriggerjumpFix(int client)
+{
+	float landOrigin[3], landOriginBelow[3], mins[3], maxs[3], landingPoint[3];
+	landOrigin = g_vPostDuckOrigin[client];
+	landOriginBelow = landOrigin;
+	landOriginBelow[2] -= LAND_HEIGHT;
+
+	GetEntPropVector(client, Prop_Data, "m_vecMins", mins);
+	GetEntPropVector(client, Prop_Data, "m_vecMaxs", maxs);
+
+	TR_TraceHullFilter(landOrigin, landOriginBelow, mins, maxs, MASK_PLAYERSOLID, PlayerFilter);
+	if (!TR_DidHit()) return;
+
+	TR_GetEndPosition(landingPoint);
+
+	DebugMsg(client, "Landed mid-tick at %.3f", landOrigin[2]);
+	DoTriggerjumpFix(client, landingPoint, mins, maxs, landOrigin[2] - landingPoint[2] + maxs[2]);
 }
 
 bool DoStairsFix(int client)
@@ -1216,10 +1234,17 @@ public void Hook_PlayerPostThink(int client)
 
 	if (landed && TR_GetFraction() > 0.0)
 	{
-		DoTriggerjumpFix(client, landingPoint, landingMins, landingMaxs);
+		DoTriggerjumpFix(client, landingPoint, landingMins, landingMaxs, origin[2] - landingPoint[2]);
 
 		// Check if a trigger we just touched put us in the air (probably due to a teleport).
 		if (GetEntityFlags(client) & FL_ONGROUND == 0) landed = false;
+	}
+	else if (g_iLastLandTick[client] == g_iTick[client] && g_iLastTickPredicted[client] == g_iTick[client]
+		&& GetEntPropEnt(client, Prop_Data, "m_hGroundEntity") == -1)
+	{
+		// Unducking in the air drops the origin and can land you mid-tick, then CheckJumpButton jumps you in the
+		// same tick. The touch check only sees where the jump left you, so fire whatever you landed in or above.
+		DoMidTickTriggerjumpFix(client);
 	}
 
 	// The stair sliding fix changes the outcome of this tick more significantly, so it doesn't really make sense to do incline fixes too.
